@@ -1,0 +1,143 @@
+---
+- name: Deploy Loki and Promtail for log aggregation
+  hosts: observability
+  become: true
+  vars:
+    loki_version: "2.9.4"
+    loki_port: 3100
+    loki_data_dir: /opt/loki
+    loki_config_dir: /etc/loki
+    promtail_config_dir: /etc/promtail
+
+  tasks:
+    - name: Create Loki directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ loki_config_dir }}"
+        - "{{ loki_data_dir }}"
+        - "{{ loki_data_dir }}/chunks"
+        - "{{ loki_data_dir }}/rules"
+        - "{{ loki_data_dir }}/compactor"
+
+    - name: Deploy Loki configuration
+      ansible.builtin.copy:
+        dest: "{{ loki_config_dir }}/loki-config.yml"
+        mode: "0644"
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: {{ loki_port }}
+            grpc_listen_port: 9096
+          common:
+            path_prefix: {{ loki_data_dir }}
+            storage:
+              filesystem:
+                chunks_directory: {{ loki_data_dir }}/chunks
+                rules_directory: {{ loki_data_dir }}/rules
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: tsdb
+                object_store: filesystem
+                schema: v13
+                index:
+                  prefix: index_
+                  period: 24h
+          limits_config:
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+          compactor:
+            working_directory: {{ loki_data_dir }}/compactor
+            compaction_interval: 10m
+            retention_enabled: true
+            retention_period: 336h
+      notify: Restart loki
+
+    - name: Run Loki container
+      community.docker.docker_container:
+        name: loki
+        image: "grafana/loki:{{ loki_version }}"
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "{{ loki_port }}:{{ loki_port }}"
+        volumes:
+          - "{{ loki_config_dir }}/loki-config.yml:/etc/loki/local-config.yaml:ro"
+          - "{{ loki_data_dir }}:{{ loki_data_dir }}"
+        command: "-config.file=/etc/loki/local-config.yaml"
+        networks:
+          - name: observability-net
+
+    - name: Create Promtail config directory
+      ansible.builtin.file:
+        path: "{{ promtail_config_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Deploy Promtail configuration
+      ansible.builtin.copy:
+        dest: "{{ promtail_config_dir }}/promtail-config.yml"
+        mode: "0644"
+        content: |
+          server:
+            http_listen_port: 9080
+          positions:
+            filename: /tmp/positions.yaml
+          clients:
+            - url: http://loki:{{ loki_port }}/loki/api/v1/push
+          scrape_configs:
+            - job_name: system
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: varlogs
+                    __path__: /var/log/**/*.log
+            - job_name: docker
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: docker
+                    __path__: /var/lib/docker/containers/*/*-log
+              pipeline_stages%7B%7D: []
+      notify: Restart promtail
+
+    - name: Run Promtail container
+      community.docker.docker_container:
+        name: promtail
+        image: "grafana/promtail:{{ loki_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ promtail_config_dir }}/promtail-config.yml:/etc/promtail/config.yml:ro"
+          - "/var/log:/var/log:ro"
+          - "/var/lib/docker/containers:/var/lib/docker/containers:ro"
+        command: "-config.file=/etc/promtail/config.yml"
+        networks:
+          - name: observability-net
+
+    - name: Verify Loki is healthy
+      ansible.builtin.uri:
+        url: "http://localhost:{{ loki_port }}/ready"
+        status_code: 200
+      register: loki_health
+      until: loki_health.status == 200
+      retries: 10
+      delay: 5
+
+  handlers:
+    - name: Restart loki
+      community.docker.docker_container:
+        name: loki
+        restart: true
+
+    - name: Restart promtail
+      community.docker.docker_container:
+        name: promtail
+        restart: true
